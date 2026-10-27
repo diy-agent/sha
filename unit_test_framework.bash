@@ -52,18 +52,29 @@ assert_contains(){
 
 
 # 查找出所有"test_"开头的函数并执行
+# 单个用例失败只计数不中断, 最后汇总返回非零 (用 if 接住, 否则 set -e 会直接杀掉整个测试进程)
 function run_tests(){
+      local failed=0 total=0
       while IFS=$'\n' read -r functionName ; do
         [[ "$functionName" != test_* ]] && continue ;
+        total=$((total+1))
         # run test
         printf "test: %s %-50s" "${TEST_PATH}" "$functionName()"
         # TIMEFORMAT: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html
         # %R==real %U==user %S==sys %P==(user+sys)/real
         TIMEFORMAT="real %R user %U sys %S percent %P"
-        (
+        if (
           # 隔离test在子shell里，防止环境互相影响
           time "$functionName" ;
-        )# 2>&1
+        ); then
+          echo "PASS: $functionName"
+        else
+          echo "FAIL: $functionName (rc=$?)"
+          failed=$((failed+1))
+        fi # 2>&1
   #    done <<< "$(compgen -A function)" # 还是declare -F 再过滤保险
       done <<<"$(declare -F | grep "declare -f" | awk {'print $3'} )"
+      echo "----------------------------------------"
+      echo "tests: total=$total failed=$failed"
+      return "$failed"
 }

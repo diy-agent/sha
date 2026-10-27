@@ -17,12 +17,13 @@ source "$TEST_DIR/unit_test_framework.bash"
 source "$TEST_DIR/sha.bash"
 
 # 同进程隔离运行一次 sha 调用:
-#   每次调用 = 一个子 shell, 函数定义和 _sha_* 全局注册表修改都不出逃,
+#   函数定义和 _sha_* 全局注册表修改都在 $(...) 命令替换的子 shell 里, 不出逃,
 #   父进程状态永远干净, 用例之间天然隔离, 无需 bash -c 起新进程。
-# Windows 下 bash -c 新进程极慢, 子 shell 只是 fork, 快一个数量级。
+#   (sha 已改 exit→return, 无需再包一层子 shell 接退出; $(...) 本身就是一次 fork)
 # 用法: sha_run <fixture_setup_func> <cmd...> -- fixture 里只定义命令函数
 #   输出: 被测命令的 stdout (stderr 重定向到 stdout, 方便断言 help/报错)
-sha_run() ( "$@" 2>&1 )
+#   返回码: 0 成功, 1 未知命令, 3 父命令缺子命令
+sha_run() { "$@" 2>&1; }
 
 # --- fixture: 各用例的命令定义, 只定义函数, 不执行 ---
 
@@ -64,6 +65,22 @@ test_sub_command() {
 }
 
 # 内外命令有重名，进入一级命令后正确识别
+test_unknown_command_returns_1() {
+  local status=0
+  sha_run fixture_simple no_such_cmd >/dev/null 2>&1 || status=$?
+  assert_equals "1" "$status"
+  assert_contains "unknown command" "$(sha_run fixture_simple no_such_cmd)"
+}
+
+test_parent_without_subcommand_returns_3() {
+  local status=0
+  sha_run fixture_sub b >/dev/null 2>&1 || status=$?
+  assert_equals "3" "$status"
+  status=0
+  sha_run fixture_dup >/dev/null 2>&1 || status=$?
+  assert_equals "3" "$status"
+}
+
 test_duplicated_command() {
   assert_equals "aaa" "$(sha_run fixture_dup aaa)"
 

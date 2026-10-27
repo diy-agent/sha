@@ -431,10 +431,12 @@ _sha() {
   # echo "_sha(): args:[$*] , current_cmds:[${_sha_all_registerd_cmds[*]}]"
   shift
 
-  # 非法命令
+  # 非法命令: 用 return 而不用 exit, sha.bash 是被 source 的库,
+  # 不能替调用方决定进程生死; 调用方入口写 sha "$@" || exit $? 即可保持旧行为。
+  # 退出码: 1 = 未知命令, 3 = 父命令缺子命令
   if [[  "${_sha_current_cmd_children[$cmd]}" == "" ]]; then
     echo  "ERROR: unknown command $cmd, 请使用 './sha --help' 查看可用的命令。 "
-    exit 1;
+    return 1;
   fi
   
   # 执行当前命令后，再注册当前命令的子命令
@@ -450,7 +452,7 @@ _sha() {
   if (( $#==0 )); then
     _sha_help
     echo "当前为父命令($cmd), 请使用子命令, 例如: ${BASH_SOURCE[-1]} <cmd> [args]"
-    exit 3;
+    return 3;
   fi
 
   # 后面还有参数,递归处理
@@ -458,6 +460,10 @@ _sha() {
 }
 
 sha() {
+  # 总入口每次重置注册表: 同一进程调多次 sha 时, 第二次的函数体与已记录的相同,
+  # diff 会得到空集并误判为叶子命令 (静默 return 0)。重置后每次都做全新发现,
+  # 行为与全新进程一致。_sha_reset 是纯内建操作, 约 1ms, 无 fork。
+  _sha_reset
   _sha_register_children_cmds "/"
 
   # 根命令本身就是leaf，返回即可
@@ -469,7 +475,7 @@ sha() {
   if (( $#==0 )); then
     _sha_help
     echo "当前为根命令, 请使用子命令, 例如: ${BASH_SOURCE[-1]} <cmd> [args]"
-    exit 3;
+    return 3;
   fi
   # not leaf cmd, has args, process args
   _sha "$@"
