@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
-# sha.bash对bash环境目前影响是：
-#   - 捕获打印错误(trap "_sha_on_error" ERR)
-#   - 设置了nullglob行为，防止错误的数组值(shopt -s nullglob)
+# sha.bash 对 bash 环境的影响 (默认全部关闭, 按需开启):
+#   - SHA_DEBUG=1             才挂 trap "_sha_on_error" ERR (打印调用栈)
+#   - SHA_CHECK_SYS_CONFLICT=1 才枚举系统命令做函数名冲突检查
+#   - nullglob: source 时临时打开, 结束即恢复调用方原状, 不污染
 
 
 # sha.bash消费者请选用以下关键参数，sha.bash默认不开启这些参数，尽量不影响bash默认环境
@@ -32,7 +33,13 @@
 # declare -a a=()
 # -------------------------s
 # 空数组!这是我们想要的
-shopt -s nullglob
+# 只在 source 期间临时打开, 结束后恢复调用方原状 (库不应改全局 shopt)
+if shopt -q nullglob; then
+  _sha_nullglob_was_on=1
+else
+  _sha_nullglob_was_on=0
+  shopt -s nullglob
+fi
 
 
 
@@ -48,6 +55,8 @@ declare -A _sha_current_cmd_children
 # 当前命令链, 比如执行docker container ls时，解析到最后一个ls时的命令链是：_sha_cmd_chain=(docker container ls)
 declare _sha_cmd_chain=()
 declare _sha_cmd_exclude=("_*" "fn_*" "sha") # 示例前缀数组
+# 函数体比对用的临时文件 (declare -f 重定向到此, 避免 $(...) fork; 见 _sha_register_children_cmds)
+_sha_dump_file="${TMPDIR:-/tmp}/sha_dump_${BASHPID:-$$}"
 
 # 系统命令列表, 用于判断我们的命令名是否和系统命令冲突
 declare -A _sha_sys_commands
@@ -72,8 +81,12 @@ _sha_pwd() {
 #
 # log_level: DEBUG|INFO|ERROR|FATAL
 _sha_log(){
-  local level="$1"
-  echo -e "$level $(date "+%F %T") $(_sha_pwd "$PWD")\$ ${func_name[1]}() : $*" >&2
+  local level="$1"; shift
+  # NOTE: 不用 $(date)/$( _sha_pwd), $(...) 每次 fork; 用内建 printf %T + 参数展开
+  local ts
+  # shellcheck disable=SC2183
+  printf -v ts '%(%F %T)T' -1
+  echo -e "$level $ts ${PWD/#$HOME/\~}\$ ${FUNCNAME[1]}() : $*" >&2
 }
 
 _sha_on_error() {
@@ -85,14 +98,16 @@ _sha_on_error() {
     stackInfo=$(caller $i 2>&1 && true) && true
     if [[ $? != 0 ]]; then return 0; fi
 
-    # 一行调用栈 '97 bake.build ./note/bake'
-    #    解析后 =>  行号no=97 , 报错的函数func=bake.build , file=./note/bake
+    # 一行调用栈 '97 my_cmd ./note/sha'
+    #    解析后 =>  行号no=97 , 报错的函数func=my_cmd , file=./note/sha
     local no func file
     IFS=' ' read -r no func file <<<"$stackInfo"
 
     # 打印出可读性强的信息:
-    #    => ./note/bake:38 -> bake.build
-    printf "%s\n" "$(_sha_real_path $file):$no -> $func" >&2
+    #    => ./note/sha:38 -> my_cmd
+    # NOTE: 不用 $(_sha_real_path), 循环内每次 fork; 内联展开即可
+    [[ $file = /* ]] || file="$PWD/${file#./}"
+    printf "%s\n" "$file:$no -> $func" >&2
 
     i=$((i + 1))
   done
@@ -116,23 +131,30 @@ _sha_clear_associative_array() {
     # 这使得 'arr_ref' 成为一个指向由 $array_name 指定的实际关联数组的别名
     # 对 arr_ref 的任何操作都会直接作用于原始关联数组
     # requires Bash 4.3+
-    declare -n arr_ref="$array_name"
-
-    # 检查由 $array_name 指定的变量是否存在且是否确实是一个关联数组
-    # declare -p 会打印变量的属性，grep -q 检查输出是否包含 "declare -A"
-    # 2>/dev/null 忽略当变量不存在时 declare -p 可能输出的错误信息
-    if ! declare -p "$array_name" 2>/dev/null | grep -q "declare -A"; then
+    # 注意: 刻意不用 declare -p | grep 做类型校验, 管道每次 fork 子进程,
+    # 在 Windows Git Bash 下极慢; 调用方只传已知关联数组即可。
+    declare -n arr_ref="$array_name" 2>/dev/null || {
          echo "错误: 变量 '$array_name' 不存在或不是一个已声明的关联数组。" >&2
          return 1
-    fi
+    }
 
     # 获取数组的所有键的列表，并循环遍历
     # "${!arr_ref[@]}" 通过名称引用获取原始关联数组的所有键
     for key in "${!arr_ref[@]}"; do
         # 使用 unset 命令删除当前键对应的元素
         # "arr_ref["$key"]" 通过名称引用访问原始关联数组的元素
-        unset 'arr_ref["$key"]'
+        unset "arr_ref[$key]"
     done
+}
+
+# 测试/复用入口: 重置 sha 全局注册状态, 使同进程内可多次独立运行。
+# 子 shell ( ... ) 只能隔离变量修改, 但函数定义在父 shell 已存在时会污染跨用例;
+# 因此每个用例先 unset 上个用例的 fixture 函数, 再 _sha_reset, 即可同进程隔离,
+# 无需每次 bash -c 起新进程 (Windows 下新进程极慢)。
+_sha_reset() {
+  _sha_clear_associative_array _sha_all_registerd_cmds >/dev/null 2>&1 || true
+  _sha_clear_associative_array _sha_current_cmd_children >/dev/null 2>&1 || true
+  _sha_cmd_chain=()
 }
 
 
@@ -304,24 +326,6 @@ _sha_array_difference() {
 
 
 
-# 函数：获取当前子命令集合，并使用指定的分隔符连接输出。
-# Usage: _sha_cmd_get_children [delimiter:\n]
-# delimiter (可选): 用于连接命令字符串的分隔符, 如果未提供，默认使用换行符。
-# 输出: 连接后的命令字符串集合到标准输出。
-_sha_cmd_get_children() {
-    local delimiter=${1:-'\n'} # 声明局部变量用于存储分隔符
-
-    # --- 使用分隔符连接并输出 ---
-    # 使用子 Shell 和 IFS 来临时改变字段分隔符
-    # 子Shell不会污染当前 Shell 环境 IFS 的方法
-    (
-        # 设置 IFS 为确定的分隔符
-        IFS="$delimiter"
-        # 使用 "${_sha_current_cmd_children[*]}" 扩展数组的所有元素，并用 IFS 的第一个字符连接它们
-        echo "${_sha_current_cmd_children[*]}"
-    ) 
-}
-
 # Usage: _sha_register_children_cmds <cmd_level>
 # ensure all cmd register
 # root cmd_level is "/"
@@ -342,7 +346,11 @@ _sha_register_children_cmds() {
         # 添加其他想处理的函数名
     esac
 
-    func_content=$(declare -f "$func_name")
+    # NOTE: 刻意不用 func_content=$(declare -f ...) , $(...) 每次 fork 子进程,
+    # N 个函数 = N 次 fork, Windows Git Bash 下慢 10~50 倍。
+    # 改用内建重定向 + $(<file) (bash 对 $(<file) 有免 fork 优化), 全程零 fork。
+    declare -f "$func_name" >"$_sha_dump_file"
+    func_content=$(<"$_sha_dump_file")
 
     # 暂时关闭系统命令检测，等回头做成一个options, 严格模式
     # if [[ -v _sha_sys_commands["$func_name"] ]]; then
@@ -407,24 +415,6 @@ Available Commands:"
   done  
   echo
 }
-
-# cmd  (public api)
-# 注册一个命令的帮助信息
-# Examples:
-#   cmd "sha [options] " --desc "build project"
-# 尤其是可以配置root命令以定制根命令的帮助信息，比如:
-#   cmd --cmd root \
-#             --desc "flutter-note cli."
-# 这样就可以用'./your_script -h' 查看根帮助了
-# cmd() {
-#   local __cmd="$1" __desc="$2"
-
-#   if [[ "$__cmd" == "" ]]; then
-#     echo "error, please: @cmd <cmd> [description] " >&2
-#     return 1
-#   fi
-# }
-
 
 _sha_is_leaf_cmd() {
   if [[ "${#_sha_current_cmd_children[@]}" == "0" ]]; then
@@ -522,5 +512,20 @@ _sha_register_sys_commands() {
 #######################################
 ## 入口
 #######################################
-trap "_sha_on_error" ERR
-_sha_register_sys_commands
+# Windows(Git Bash/MSYS2)下说明:
+# 1. compgen -c 会枚举 PATH 下数千个命令+逐个循环, 在 Windows fork 仿真下极慢,
+#    所以默认关闭, 仅在 SHA_CHECK_SYS_CONFLICT=1 时才做系统命令冲突检查。
+# 2. trap ERR 会给每条命令加钩子, Windows 下也有可感知的开销,
+#    默认关闭, 仅在 SHA_DEBUG=1 时开启出错堆栈。
+if [[ "${SHA_CHECK_SYS_CONFLICT:-0}" == "1" ]]; then
+  _sha_register_sys_commands
+fi
+if [[ "${SHA_DEBUG:-0}" == "1" ]]; then
+  trap "_sha_on_error" ERR
+fi
+
+# 恢复调用方的 nullglob 原状 (见文件头)
+if [[ "${_sha_nullglob_was_on:-1}" == "0" ]]; then
+  shopt -u nullglob
+fi
+unset _sha_nullglob_was_on

@@ -51,9 +51,7 @@ assert_contains(){
 }
 
 
-# TODO bake.__cmd_children 命令可以改造为既可以输出全称也可以输出短名，还可以设置depth展示层级
-# 查找出所有"tests."开头的函数并执行
-# 这种测试有点麻烦，不如bake.test
+# 查找出所有"test_"开头的函数并执行
 function run_tests(){
       while IFS=$'\n' read -r functionName ; do
         [[ "$functionName" != test_* ]] && continue ;
