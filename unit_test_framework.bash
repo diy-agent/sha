@@ -49,6 +49,15 @@ assert_contains(){
      return 2
   fi
 }
+assert_not_contains(){
+  local expected="$1" actual="$2"  msg="$3"
+  if [[ "$actual" == *"$expected"* ]] ; then
+    assert_fail "assert fail: $msg
+     actual         : [$actual]
+     should not contain: [$expected]"
+     return 2
+  fi
+}
 
 
 # 查找出所有"test_"开头的函数并执行
@@ -63,13 +72,23 @@ function run_tests(){
         # TIMEFORMAT: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html
         # %R==real %U==user %S==sys %P==(user+sys)/real
         TIMEFORMAT="real %R user %U sys %S percent %P"
-        if (
+        # P0 修: 不能用 if ( time ... ) 包测试 —— condition context 会关掉子 shell
+        # 里的 set -e, assert 失败后只要后面还有成功的 assert, 用例仍会 PASS。
+        # 改法: 外层 set +e, 子 shell 里显式 set -e, 状态码自己取。
+        local status _e_was_on=0
+        case $- in *e*) _e_was_on=1;; esac
+        set +e
+        (
           # 隔离test在子shell里，防止环境互相影响
+          set -e
           time "$functionName" ;
-        ); then
+        )
+        status=$?
+        if (( _e_was_on )); then set -e; fi
+        if (( status == 0 )); then
           echo "PASS: $functionName"
         else
-          echo "FAIL: $functionName (rc=$?)"
+          echo "FAIL: $functionName (rc=$status)"
           failed=$((failed+1))
         fi # 2>&1
   #    done <<< "$(compgen -A function)" # 还是declare -F 再过滤保险

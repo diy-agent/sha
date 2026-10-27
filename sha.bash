@@ -48,15 +48,19 @@ fi
 
 _sha_real_path() {  [[ $1 = /* ]] && echo "$1" || echo "$PWD/${1#./}" ; }
 
-# 所有找到的子命令列表，不清理，用于每次注册子命令时判断是否为新命令，key是函数名，value是函数内容
-declare -A _sha_all_registerd_cmds
-# 当前命令子命令列表,每次进入新的命令层级，会清空置换为当前命令的children，key是函数名，value是函数内容
-declare -A _sha_current_cmd_children
-# 当前命令链, 比如执行docker container ls时，解析到最后一个ls时的命令链是：_sha_cmd_chain=(docker container ls)
-declare _sha_cmd_chain=()
-declare _sha_cmd_exclude=("_*" "fn_*" "sha") # 示例前缀数组
-# 函数体比对用的临时文件 (declare -f 重定向到此, 避免 $(...) fork; 见 _sha_register_children_cmds)
-_sha_dump_file="${TMPDIR:-/tmp}/sha_dump_${BASHPID:-$$}"
+# 自注册约定 (函数名即命令, 无需执行、无需声明):
+#   build.web() / build__web()  →  sha build web      (. 与 __ 都是层级分隔符, 可混用)
+#   run_tests()                 →  sha run_tests      (单个 _ 永不拆分, 保护 snake_case)
+#   _foo / fn_x / sha...        →  私有, 不注册 (见 _sha_cmd_exclude)
+# 规则:
+#   段不能为空 (a..b / .a / a__ 注册时报错)
+#   同一路径撞车 (a.b 与 a__b) → 注册报错, 逼你二选一, 绝不静默覆盖
+#   附带好处: 带 . 的函数名永远撞不上系统命令 (命令名里不能有 .)
+# 命令表: key=空格分隔路径 ("build web"), value=函数名 ("build.web")
+declare -A _SHA_FUNC=()
+# 纯分组表: 有子命令的路径 (即使它自己也有同名函数, 比如 build() + build.web())
+declare -A _SHA_PARENT=()
+declare _sha_cmd_exclude=("_*" "fn_*" "sha" "sha__*" "sha_*" "sha.*") # 私有前缀, 不注册为命令
 
 # 系统命令列表, 用于判断我们的命令名是否和系统命令冲突
 declare -A _sha_sys_commands
@@ -147,15 +151,7 @@ _sha_clear_associative_array() {
     done
 }
 
-# 测试/复用入口: 重置 sha 全局注册状态, 使同进程内可多次独立运行。
-# 子 shell ( ... ) 只能隔离变量修改, 但函数定义在父 shell 已存在时会污染跨用例;
-# 因此每个用例先 unset 上个用例的 fixture 函数, 再 _sha_reset, 即可同进程隔离,
-# 无需每次 bash -c 起新进程 (Windows 下新进程极慢)。
-_sha_reset() {
-  _sha_clear_associative_array _sha_all_registerd_cmds >/dev/null 2>&1 || true
-  _sha_clear_associative_array _sha_current_cmd_children >/dev/null 2>&1 || true
-  _sha_cmd_chain=()
-}
+# _sha_reset() 见下文 sha 命令实现区: _sha_reset() { _sha_register_all; }
 
 
 
@@ -326,159 +322,109 @@ _sha_array_difference() {
 
 
 
-# Usage: _sha_register_children_cmds <cmd_level>
-# ensure all cmd register
-# root cmd_level is "/"
-_sha_register_children_cmds() {
-  local next_cmd="$1"
-
-  _sha_cmd_chain+=("$next_cmd")
-
-  # 每次清空，避免重复注册，目前的简化模型，只注册当前层级命令，不注册子命令
-  declare -A new_children
-  local func_name func_content
-  while IFS=$'\n' read -r func_name; do
-
-    # check func_name
-    case "$func_name" in
-        */*)  _sha_log ERROR "function name $func_name() can not contains '/' " >&2
-              return 1 ;;
-        # 添加其他想处理的函数名
-    esac
-
-    # NOTE: 刻意不用 func_content=$(declare -f ...) , $(...) 每次 fork 子进程,
-    # N 个函数 = N 次 fork, Windows Git Bash 下慢 10~50 倍。
-    # 改用内建重定向 + $(<file) (bash 对 $(<file) 有免 fork 优化), 全程零 fork。
-    declare -f "$func_name" >"$_sha_dump_file"
-    func_content=$(<"$_sha_dump_file")
-
-    # 暂时关闭系统命令检测，等回头做成一个options, 严格模式
-    # if [[ -v _sha_sys_commands["$func_name"] ]]; then
-    #   echo  "ERROR: function '$func_name' 和os系统命令或alias重名, 请检查这个函数:"
-    #   echo "$func_content"
-    #   exit 1;
-    # fi
-    
-    # 新增的cmd才是下一级的cmd
-    # 父节点的子命令中可能和当前节点子命令同名
-    # 判断依据为：只要当前节点识别出的函数与老的不同即认为是当前节点的子命令：
-    # 1. 父节点没有注册过的
-    # 2. 父节点注册过同名的，但内容不一样的
-    if [[ "${_sha_all_registerd_cmds["$func_name"]}" == "$func_content"  ]]; then
-      continue;
-    fi
-    
-    # 排除掉某些前缀
-    local exclude
-    local is_excluded=false
-    for exclude in "${_sha_cmd_exclude[@]}" ;do
-      # 只要匹配一个非cmd前缀，就不注册cmd
+# 全量静态注册: 扫一遍函数名, 按 . 与 __ 切出命令树, 全程只需一次 compgen, 零逐函数 fork。
+# 同一进程调多次 sha 行为完全一致 (表每次重建), 不存在旧 diff 模型的状态残留问题。
+# 退出码: 1 = 非法函数名/路径撞车/未知命令, 3 = 纯分组缺子命令
+_sha_register_all() {
+  # Bash 4.4 安全写法: 不用 arr=() 清空关联数组 (4.4 下属性保留行为存疑),
+  # 走内建 unset 循环, 零 fork, 成本与 O(N) 重建相当。
+  _sha_clear_associative_array _SHA_FUNC || return $?
+  _sha_clear_associative_array _SHA_PARENT || return $?
+  local fn p rest exclude skipped
+  while IFS=$'\n' read -r fn; do
+    skipped=false
+    for exclude in "${_sha_cmd_exclude[@]}"; do
       # shellcheck disable=SC2053
-      # glob匹配
-      if [[ "$func_name" = $exclude ]]; then
-        is_excluded=true
-        break;
-      fi
+      if [[ "$fn" == $exclude ]]; then skipped=true; break; fi
     done
+    $skipped && continue
 
-    if $is_excluded ; then
-       continue 
+    # NOTE: 纯参数展开做映射, 不用 path=$(...) 捕获 (每次捕获=一次 fork, N 个函数=N 次 fork)。
+    # 先 __ 再 . : __ 优先级高, a__b 与 a.b 都映射到 "a b" (撞车则报错, 见下)。
+    p=${fn//__/ }
+    p=${p//./ }
+    if [[ -z "$p" || "$p" == ' '* || "$p" == *' ' || "$p" == *'  '* ]]; then
+      echo "ERROR: 非法命令函数名 [$fn], 段不能为空 (如 .a / a..b / a__)" >&2
+      return 1
     fi
-
-    new_children["$func_name"]="$func_content"
-
-  # 获取所有函数名输入到while循环里
-  # < <(...) 将管道 compgen -A function 的输出作为 while read 的标准输入
-  # compgen -A function比declare -F都是bash的内置函数，但declare -F在各版本间输出有变化所以不用
+    if [[ -n "${_SHA_FUNC[$p]+x}" && "${_SHA_FUNC[$p]}" != "$fn" ]]; then
+      echo "ERROR: 命令 [$p] 撞车: [${_SHA_FUNC[$p]}] vs [$fn], . 与 __ 别混用, 二选一" >&2
+      return 1
+    fi
+    _SHA_FUNC[$p]="$fn"
+    rest=$p
+    while [[ "$rest" == *' '* ]]; do rest=${rest% *}; _SHA_PARENT[$rest]=1; done
   done < <(compgen -A function)
-
-  # 填充为下一级命令列表
-  # 设置下一级的命令列表前先清空上一级列表
-  _sha_clear_associative_array _sha_current_cmd_children
-  # "${!new_children[@]}" 会扩展为关联数组的所有键的列表
-  for key in "${!new_children[@]}"; do
-      _sha_all_registerd_cmds["$key"]="${new_children["$key"]}"
-      _sha_current_cmd_children["$key"]="${new_children["$key"]}"
-  done  
-
 }
 
-_sha_help() {
+# 测试/复用入口: 重建命令表 (现在 _sha_register_all 本身就是无状态重建, 这里只是别名)。
+_sha_reset() { _sha_register_all; }
+
+_sha_help() { # $1=路径 ("" 为根)
+  local path=$1 prefix key seg
+  if [[ -z "$path" ]]; then prefix=""; else prefix="$path "; fi
   echo
   echo "${BASH_SOURCE[-1]} help:"
+  [[ -n "$path" ]] && echo "command: $path"
   echo
-  echo "
-Available Commands:"
-
-  for key in "${!_sha_current_cmd_children[@]}"; do
-      echo "  $key"
-  done  
+  echo "Available Commands:"
+  local -A seen=()
+  local k stripped
+  for k in "${!_SHA_FUNC[@]}" "${!_SHA_PARENT[@]}"; do
+    [[ "$k" == root ]] && continue
+    if [[ -z "$path" ]]; then
+      [[ "$k" == *' '* ]] && seg=${k%% *} || seg=$k
+    else
+      [[ "$k" == "$prefix"* ]] || continue
+      stripped=${k#$prefix}
+      [[ "$stripped" == *' '* ]] && seg=${stripped%% *} || seg=$stripped
+    fi
+    seen[$seg]=1
+  done
+  for seg in "${!seen[@]}"; do
+    if [[ -n "${_SHA_PARENT[$prefix$seg]+x}" ]]; then
+      printf '  %s/\n' "$seg"
+    else
+      printf '  %s\n' "$seg"
+    fi
+  done | sort
   echo
 }
 
-_sha_is_leaf_cmd() {
-  if [[ "${#_sha_current_cmd_children[@]}" == "0" ]]; then
-    return 0;
-  fi
-  return 1;
-}
-
-
-
-
-_sha() {
-  local cmd="$1"
-  # echo "_sha(): args:[$*] , current_cmds:[${_sha_all_registerd_cmds[*]}]"
-  shift
-
-  # 非法命令: 用 return 而不用 exit, sha.bash 是被 source 的库,
-  # 不能替调用方决定进程生死; 调用方入口写 sha "$@" || exit $? 即可保持旧行为。
-  # 退出码: 1 = 未知命令, 3 = 父命令缺子命令
-  if [[  "${_sha_current_cmd_children[$cmd]}" == "" ]]; then
-    echo  "ERROR: unknown command $cmd, 请使用 './sha --help' 查看可用的命令。 "
-    return 1;
-  fi
-  
-  # 执行当前命令后，再注册当前命令的子命令
-  "$cmd" "$@"
-  _sha_register_children_cmds "$cmd"
-
-  # 根命令本身就是leaf，返回即可
-  if _sha_is_leaf_cmd; then
-    return 0;
-  fi
-
-  # not leaf cmd, no args, help
-  if (( $#==0 )); then
-    _sha_help
-    echo "当前为父命令($cmd), 请使用子命令, 例如: ${BASH_SOURCE[-1]} <cmd> [args]"
-    return 3;
-  fi
-
-  # 后面还有参数,递归处理
-  _sha "$@"
-}
-
+# 总入口 (public api)。用法见文件头自注册约定。
+# 分发规则 (贪心最长匹配, 只执行最深命中的函数, 父级不顺带执行):
+#   sha build web --target x → 命中 "build web", 余下参数全透给实现函数
+#   sha build (build 是纯分组)  → 打印该组 help, return 3
+#   sha build bad (build 是纯分组) → unknown command, return 1
+#   sha (无参数) → root() 存在则执行, 否则根 help, return 3
+#   退出码: 0 成功, 1 未知命令/注册失败, 3 缺子命令
 sha() {
-  # 总入口每次重置注册表: 同一进程调多次 sha 时, 第二次的函数体与已记录的相同,
-  # diff 会得到空集并误判为叶子命令 (静默 return 0)。重置后每次都做全新发现,
-  # 行为与全新进程一致。_sha_reset 是纯内建操作, 约 1ms, 无 fork。
-  _sha_reset
-  _sha_register_children_cmds "/"
-
-  # 根命令本身就是leaf，返回即可
-  if _sha_is_leaf_cmd; then
-    return 0;
+  _sha_register_all || return $?
+  local path="" cand
+  while (( $# > 0 )); do
+    case $1 in -h|--help) _sha_help "$path"; return 0;; esac
+    if [[ -z "$path" ]]; then cand=$1; else cand="$path $1"; fi
+    if [[ -n "${_SHA_PARENT[$cand]+x}" || -n "${_SHA_FUNC[$cand]+x}" ]]; then
+      path=$cand; shift
+    else
+      break
+    fi
+  done
+  if [[ -z "$path" ]]; then
+    if (( $# == 0 )); then
+      if [[ -n "${_SHA_FUNC[root]+x}" ]]; then ${_SHA_FUNC[root]}; return $?; fi
+      _sha_help ""; return 3
+    fi
+    echo "ERROR: unknown command [$1], 用 'sha --help' 查看可用命令" >&2
+    return 1
   fi
-
-  # not leaf cmd, no args, help
-  if (( $#==0 )); then
-    _sha_help
-    echo "当前为根命令, 请使用子命令, 例如: ${BASH_SOURCE[-1]} <cmd> [args]"
-    return 3;
+  if [[ -z "${_SHA_FUNC[$path]+x}" ]]; then
+    if (( $# == 0 )); then _sha_help "$path"; return 3; fi
+    echo "ERROR: unknown command [$path $1], 用 'sha $path --help' 查看" >&2
+    return 1
   fi
-  # not leaf cmd, has args, process args
-  _sha "$@"
+  # 用 return 而不用 exit: sha.bash 是被 source 的库, 不能替调用方决定进程生死。
+  local fn=${_SHA_FUNC[$path]}; "$fn" "$@"
 }
 
 
