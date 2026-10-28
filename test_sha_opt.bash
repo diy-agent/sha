@@ -447,7 +447,8 @@ test_S33_def_help() {
   out=$(sha.def --help 2>&1) || rc=$?
   assert_equals "0" "$rc"
   assert_contains "command: sha def" "$out"
-  assert_contains -- "--opt" "$out"
+  assert_contains "--opt" "$out"
+  assert_contains "--arg" "$out"
 }
 
 # S34 sha.def 不接受位置参数（-- 之后的也不行）
@@ -481,6 +482,68 @@ test_S36_bad_path_after_norm() {
   out=$(sha.def "b..c" --desc x 2>&1) || rc=$?
   assert_equals "1" "$rc"
   assert_contains "命令路径非法" "$out"
+}
+
+# S37 --arg 基本存储
+test_S37_arg_basic() {
+  local out rc=0
+  out=$(sha.def "svc" --arg "FILE:输入文件" --arg "LIMIT:数量上限" 2>&1 \
+    && printf '|args=%s|h=%s' "${_SHA_OPT_ARGS[svc]}" "${_SHA_OPT_ARG_HELP[svc|FILE]}") || rc=$?
+  assert_equals "0" "$rc"
+  assert_contains "args=FILE LIMIT" "$out"
+  assert_contains "h=输入文件" "$out"
+}
+
+# S38 必填 / variadic / 必填 variadic
+test_S38_arg_flags() {
+  local out rc=0
+  out=$(sha.def "svc" --arg "SRC!:源文件" --arg "FILES...:文件列表" 2>&1 \
+    && printf '|req=%s|rest=%s' "${_SHA_OPT_ARG_REQ[svc|SRC]}" "${_SHA_OPT_ARG_REST[svc|FILES]}") || rc=$?
+  assert_equals "0" "$rc"
+  assert_contains "req=1" "$out"
+  assert_contains "rest=1" "$out"
+  rc=0
+  out=$(sha.def "svc2" --arg "FILES!...:至少一个" 2>&1 \
+    && printf '|req=%s|rest=%s' "${_SHA_OPT_ARG_REQ[svc2|FILES]}" "${_SHA_OPT_ARG_REST[svc2|FILES]}") || rc=$?
+  assert_equals "0" "$rc"
+  assert_contains "req=1" "$out"
+  assert_contains "rest=1" "$out"
+}
+
+# S39 非法位置参数定义
+test_S39_arg_errors() {
+  local out rc=0
+  out=$(sha.def "svc" --arg "FILE:a" --arg "FILE:b" 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "重复" "$out"
+  rc=0
+  out=$(sha.def "svc" --arg "A...:a" --arg "B:b" 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "最后一个" "$out"
+  rc=0
+  out=$(sha.def "svc" --arg "A:a" --arg "B!:b" 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "选填" "$out"
+  rc=0
+  out=$(sha.def "svc" --arg "1X:x" 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "名字" "$out"
+  rc=0
+  out=$(sha.def "*" --arg "FILE:x" 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "全局" "$out"
+}
+
+# S40 list/help 对应关系：list 选项 help 行以 NAME... 结尾（与位置参数 ... 同一套词汇）；
+# int 只做词法校验："08" 注册通过（八进制陷阱是 bash 算术的事，int 不管）
+test_S40_list_help_and_int_lexical() {
+  local out rc=0
+  out=$(sha.def "svc" --opt "--src:list:源码" --opt "--jobs:int=08:并行数" 2>&1 \
+    && printf '|def=%s\n' "${_SHA_OPT_DEFAULT[svc|jobs]}" \
+    && _sha_opt_print_help "svc" 2>&1) || rc=$?
+  assert_equals "0" "$rc"
+  assert_contains "def=08" "$out"
+  assert_contains "--src SRC..." "$out"
 }
 
 sha_run() { "$@" 2>&1; }
@@ -624,7 +687,7 @@ test_T09_unknown() {
   out=$(sha_run fixture demo --bogus --mode fast 2>&1) || rc=$?
   assert_equals "1" "$rc"
   assert_contains "unknown option [--bogus]" "$out"
-  assert_contains -- "--target" "$out"
+  assert_contains "--target" "$out"
 }
 
 # T10 未知短选项
@@ -790,7 +853,7 @@ test_T21_full_help() {
   assert_contains "usage: sha demo" "$out"
   assert_contains "备注：mode 必填" "$out"
   assert_contains "global options:" "$out"
-  assert_contains -- "--verbose" "$out"
+  assert_contains "--verbose" "$out"
 }
 
 # T22 -- 后的 --help 是位置参数
@@ -954,6 +1017,75 @@ test_T31_dot_form_end_to_end() {
     sha "$@"
   }
   assert_equals "host=example.com files=a" "$(sha_run fixture net web --host example.com a)"
+}
+
+# T32 位置参数运行时校验：缺必填 / 多余 / variadic 收集 / 选填缺席
+test_T32_positional_validation() {
+  fixture() {
+    sha.def "cp2" --arg "SRC!:源文件" --arg "DST:目标" || return $?
+    sha.def "mcat" --arg "FILES...:文件列表" || return $?
+    sha.def "mreq" --arg "FILES!...:至少一个文件" || return $?
+    cp2() {
+      local -a files=()
+      sha_opt_parse files "$@" || return $?
+      printf 'files=%s' "${files[*]}"
+    }
+    mcat() {
+      local -a files=()
+      sha_opt_parse files "$@" || return $?
+      printf 'files=%s' "${files[*]}"
+    }
+    mreq() {
+      local -a files=()
+      sha_opt_parse files "$@" || return $?
+      printf 'files=%s' "${files[*]}"
+    }
+    sha "$@"
+  }
+  local out rc=0
+  assert_equals "files=a b" "$(sha_run fixture cp2 a b)"
+  out=$(sha_run fixture cp2 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "missing argument <SRC>" "$out"
+  rc=0
+  out=$(sha_run fixture cp2 a b c 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "unexpected argument [c]" "$out"
+  assert_equals "files=a b c" "$(sha_run fixture mcat a b c)"
+  assert_equals "files=" "$(sha_run fixture mcat)"
+  rc=0
+  out=$(sha_run fixture mreq 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "missing argument" "$out"
+}
+
+# T33 help 渲染 arguments 段 + 无 --usage 时自动生成 usage；显式 usage 优先（见 T21）
+test_T33_args_help_and_auto_usage() {
+  fixture() {
+    sha.def "up" \
+      --desc "上传" \
+      --opt "--host:string=h:主机" \
+      --arg "FILE!:文件" \
+      --arg "TAG:标签" || return $?
+    sha.def "up2" \
+      --arg "FILE!:文件" || return $?
+    up() { :; }
+    up2() { :; }
+    sha "$@"
+  }
+  local out
+  out=$(sha_run fixture up -h 2>&1)
+  assert_contains "usage:" "$out"
+  assert_contains "[options]" "$out"
+  assert_contains "<FILE>" "$out"
+  assert_contains "[TAG]" "$out"
+  assert_contains "arguments:" "$out"
+  assert_contains "FILE" "$out"
+  assert_contains "(required)" "$out"
+  out=$(sha_run fixture up2 -h 2>&1)
+  assert_contains "up2" "$out"
+  assert_contains "<FILE>" "$out"
+  [[ $out != *"[options]"* ]]
 }
 
 run_tests

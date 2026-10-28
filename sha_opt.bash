@@ -35,6 +35,10 @@ declare -A _SHA_OPT_HELP=()
 declare -A _SHA_OPT_SHORT=()   # "cmd|short" -> var
 declare -A _SHA_OPT_SHORT_OF=() # "cmd|var" -> short (无则空)
 declare -A _SHA_OPT_ORDER=()   # "cmd" -> "var var ..."
+declare -A _SHA_OPT_ARGS=()      # "cmd" -> "NAME NAME ..." (位置参数，声明顺序)
+declare -A _SHA_OPT_ARG_HELP=()  # "cmd|NAME" -> help
+declare -A _SHA_OPT_ARG_REQ=()   # "cmd|NAME" -> 1 (必填)
+declare -A _SHA_OPT_ARG_REST=()  # "cmd|NAME" -> 1 (variadic ...，吞掉剩余全部)
 
 _sha_opt_error() { echo "ERROR: $*" >&2; return 1; }
 
@@ -221,6 +225,8 @@ _sha_opt_add() {
     _sha_opt_error "非法 option 定义 [$spec]，全局选项只接受选填"
     return $?
   fi
+  # NOTE: int 只做词法校验（"08" 能通过，见 S40），不管范围、不做归一化；
+  # bash 算术的八进制陷阱（$((08)) 报错）不在 int 的保证范围内。
   local re_int='^[+-]?[0-9]+$'
   if (( has_default )) && [[ $type == "int" && ! $default =~ $re_int ]]; then
     _sha_opt_error "非法 option 定义 [$spec]，默认值 [$default] 不是整数"
@@ -284,6 +290,54 @@ _sha_opt_add() {
   _SHA_OPT_ORDER[$cmd]="${_SHA_OPT_ORDER[$cmd]:+${_SHA_OPT_ORDER[$cmd]} }$var"
 }
 
+# 位置参数声明: NAME[!][...][:help]
+#   FILE        选填；FILE! 必填；FILES... 选填 variadic（吞剩余全部，须最后）；
+#   FILES!...  必填 variadic（至少 1 个，须最后）；必填不能跟在选填之后。
+# 未声明 args 的命令保持透传兼容（位置参数不校验）。
+_sha_opt_add_arg() {
+  local cmd=$1 spec=$2
+  local head help=""
+  case $spec in
+    *:* ) head=${spec%%:*}; help=${spec#*:} ;;
+    * ) head=$spec ;;
+  esac
+  local name=$head req=0 vrest=0
+  case $name in
+    *... ) vrest=1; name=${name%...} ;;
+  esac
+  case $name in
+    *! ) req=1; name=${name%!} ;;
+  esac
+  local re_name='^[A-Za-z_][A-Za-z0-9_]*$'
+  if [[ -z $name || ! $name =~ $re_name ]]; then
+    _sha_opt_error "非法位置参数定义 [$spec]，名字必须匹配 [A-Za-z_][A-Za-z0-9_]*"
+    return $?
+  fi
+  if [[ $cmd == "*" ]]; then
+    _sha_opt_error "非法位置参数定义 [$spec]，全局不接受位置参数"
+    return $?
+  fi
+  if [[ -n ${_SHA_OPT_ARG_REQ[$cmd|$name]+x} ]]; then
+    _sha_opt_error "非法位置参数定义 [$spec]，位置参数 [$name] 在 [$cmd] 重复定义"
+    return $?
+  fi
+  if [[ -n ${_SHA_OPT_ARGS[$cmd]:-} ]]; then
+    local prev=${_SHA_OPT_ARGS[$cmd]##* }
+    if [[ ${_SHA_OPT_ARG_REST[$cmd|$prev]:-0} == "1" ]]; then
+      _sha_opt_error "非法位置参数定义 [$spec]，variadic [$prev...] 必须是最后一个"
+      return $?
+    fi
+    if (( req )) && [[ ${_SHA_OPT_ARG_REQ[$cmd|$prev]:-0} != "1" ]]; then
+      _sha_opt_error "非法位置参数定义 [$spec]，必填 [$name] 不能跟在选填 [$prev] 之后"
+      return $?
+    fi
+  fi
+  _SHA_OPT_ARGS[$cmd]="${_SHA_OPT_ARGS[$cmd]:+${_SHA_OPT_ARGS[$cmd]} }$name"
+  _SHA_OPT_ARG_HELP[$cmd|$name]=$help
+  _SHA_OPT_ARG_REQ[$cmd|$name]=$req
+  _SHA_OPT_ARG_REST[$cmd|$name]=$vrest
+}
+
 ##################################################################################################
 ### desc / usage / detail 注册、help 渲染、参数解析
 ##################################################################################################
@@ -299,7 +353,7 @@ declare -A _SHA_DETAIL=()
 # 自举：本函数的四个参数直接用 option 语法声明（见文件尾 "sha def" 注册），
 # 解析走 sha_opt_parse，与用户命令同一套逻辑。
 #
-# 用法: sha.def "<cmd>" [--desc T] [--usage U] [--detail D] [--opt SPEC]...
+# 用法: sha.def "<cmd>" [--desc T] [--usage U] [--detail D] [--opt SPEC]... [--arg SPEC]...
 sha.def() {
   if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
     _sha_opt_print_help "sha def"
@@ -310,7 +364,7 @@ sha.def() {
   local cmd=""
   _sha_opt_check_cmd "$raw" cmd || return $?
   local desc="" usage="" detail=""
-  local -a opt=() rest=()
+  local -a opt=() rest=() arg=()
   sha_opt_parse rest "$@" || return $?
   if (( ${#rest[@]} )); then
     _sha_opt_error "sha.def [$cmd] 不接受位置参数 [${rest[*]}]"
@@ -322,6 +376,10 @@ sha.def() {
   if (( ${#opt[@]} )); then
     sha.option "$cmd" "${opt[@]}" || return $?
   fi
+  local a
+  for a in ${arg[@]+"${arg[@]}"}; do
+    _sha_opt_add_arg "$cmd" "$a" || return $?
+  done
 }
 
 sha.desc() {
@@ -390,18 +448,52 @@ _sha_opt_one_line() {
   printf '  %-26s %s%s\n' "$head" "$help" "$meta"
 }
 
+# usage 行：显式注册优先；否则有 opts/args 即自动生成
+#   usage: <prog> <cmd> [options] <FILE> [LIMIT] [FILES...]
+_sha_opt_print_usage() {
+  local cmd=$1
+  if [[ -n ${_SHA_USAGE[$cmd]:-} ]]; then
+    echo "usage: ${_SHA_USAGE[$cmd]}"
+    return 0
+  fi
+  if [[ -z ${_SHA_OPT_ORDER[$cmd]:-} && -z ${_SHA_OPT_ARGS[$cmd]:-} ]]; then
+    return 0
+  fi
+  local u="usage: ${0##*/} $cmd"
+  [[ -n ${_SHA_OPT_ORDER[$cmd]:-} ]] && u="$u [options]"
+  local an
+  for an in ${_SHA_OPT_ARGS[$cmd]:-}; do
+    local akey="$cmd|$an"
+    if [[ ${_SHA_OPT_ARG_REST[$akey]:-0} == "1" ]]; then
+      if [[ ${_SHA_OPT_ARG_REQ[$akey]:-0} == "1" ]]; then u="$u <$an...>"; else u="$u [$an...]"; fi
+    elif [[ ${_SHA_OPT_ARG_REQ[$akey]:-0} == "1" ]]; then u="$u <$an>"; else u="$u [$an]"; fi
+  done
+  echo "$u"
+  return 0
+}
+
 _sha_opt_print_help() {
-  local cmd=$1 v key
+  local cmd=$1 v key an akey ameta
   echo
   echo "command: $cmd"
   [[ -n ${_SHA_DESC[$cmd]:-} ]] && echo "  ${_SHA_DESC[$cmd]}"
-  [[ -n ${_SHA_USAGE[$cmd]:-} ]] && echo "usage: ${_SHA_USAGE[$cmd]}"
+  _sha_opt_print_usage "$cmd"
   [[ -n ${_SHA_DETAIL[$cmd]:-} ]] && echo "${_SHA_DETAIL[$cmd]}"
   if [[ -n ${_SHA_OPT_ORDER[$cmd]:-} ]]; then
     echo "options:"
     for v in ${_SHA_OPT_ORDER[$cmd]}; do
       key="$cmd|$v"
       _sha_opt_one_line "$key" "${_SHA_OPT_LONG[$key]}" "$v"
+    done
+  fi
+  if [[ -n ${_SHA_OPT_ARGS[$cmd]:-} ]]; then
+    echo "arguments:"
+    for an in ${_SHA_OPT_ARGS[$cmd]}; do
+      akey="$cmd|$an"
+      ameta=""
+      [[ ${_SHA_OPT_ARG_REQ[$akey]:-0} == "1" ]] && ameta=" (required)"
+      [[ ${_SHA_OPT_ARG_REST[$akey]:-0} == "1" ]] && an="$an..."
+      printf '  %-26s %s%s\n' "$an" "${_SHA_OPT_ARG_HELP[$akey]}" "$ameta"
     done
   fi
   if [[ -n ${_SHA_OPT_ORDER['*']:-} ]]; then
@@ -629,6 +721,32 @@ sha_opt_parse() {
       fi
     fi
   done
+
+  # 位置参数校验: 仅当本命令声明了 args；未声明则保持透传兼容
+  if [[ -n ${_SHA_OPT_ARGS[$cmd]:-} ]]; then
+    local -a _names=(${_SHA_OPT_ARGS[$cmd]})
+    local i=0 an
+    for an in "${_names[@]}"; do
+      local akey="$cmd|$an"
+      local areq=${_SHA_OPT_ARG_REQ[$akey]:-0} arest=${_SHA_OPT_ARG_REST[$akey]:-0}
+      if (( arest )); then
+        if (( areq && ${#_sha_pos[@]} <= i )); then
+          _sha_opt_error "missing argument <$an...> for [$cmd] (至少需要 1 个)"
+          return $?
+        fi
+        i=${#_sha_pos[@]}
+      elif (( i < ${#_sha_pos[@]} )); then
+        i=$((i+1))
+      elif (( areq )); then
+        _sha_opt_error "missing argument <$an> for [$cmd]"
+        return $?
+      fi
+    done
+    if (( i < ${#_sha_pos[@]} )); then
+      _sha_opt_error "unexpected argument [${_sha_pos[$i]}] for [$cmd]"
+      return $?
+    fi
+  fi
   return 0
 }
 
@@ -690,6 +808,7 @@ _sha_opt_take_value() {
 
 sha.option "sha def" \
   "--desc:string:命令一句话说明" \
-  "--usage:string:用法行" \
+  "--usage:string:用法行（不写则自动生成）" \
   "--detail:string:多行补充说明" \
-  "--opt:list:选项定义 (可重复)"
+  "--opt:list:选项定义 (可重复)" \
+  "--arg:list:位置参数定义 (可重复)"
