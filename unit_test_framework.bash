@@ -49,15 +49,6 @@ assert_contains(){
      return 2
   fi
 }
-assert_not_contains(){
-  local expected="$1" actual="$2"  msg="$3"
-  if [[ "$actual" == *"$expected"* ]] ; then
-    assert_fail "assert fail: $msg
-     actual         : [$actual]
-     should not contain: [$expected]"
-     return 2
-  fi
-}
 
 
 # 查找出所有"test_"开头的函数并执行
@@ -92,7 +83,7 @@ function run_tests(){
           failed=$((failed+1))
         fi # 2>&1
   #    done <<< "$(compgen -A function)" # 还是declare -F 再过滤保险
-      done <<<"$(declare -F | grep "declare -f" | awk {'print $3'} )"
+      done < <(compgen -A function)
       echo "----------------------------------------"
       echo "tests: total=$total failed=$failed"
       return "$failed"

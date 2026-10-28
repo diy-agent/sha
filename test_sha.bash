@@ -10,6 +10,7 @@ set -o pipefail  # default pipeline status==last command status, If set, status=
                 #   3.影响使用此lib的脚本
 
 TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TEST_PATH=$(basename "$TEST_DIR")
 
 # shellcheck disable=SC1091
 source "$TEST_DIR/unit_test_framework.bash"
@@ -181,59 +182,6 @@ test_help_flag() {
   }
   assert_contains "b/" "$(sha_run fixture --help)"
   assert_contains "b1" "$(sha_run fixture b --help)"
-}
-
-test_array_regex_match() {
-  # shellcheck disable=SC2034
-  a=(apple orange banana)
-  _sha_array_regex_match a "apple"
-  _sha_array_regex_match a "na"
-  _sha_array_regex_match a "o.*e"
-
-  # shellcheck disable=SC2251
-  ! _sha_array_regex_match a "abble"
-  ! _sha_array_regex_match a "e o"
-}
-
-test_array_contains() {
-  # shellcheck disable=SC2034
-  a=(apple orange banana)
-  _sha_array_contains a "apple"
-  _sha_array_contains a "orange"
-  _sha_array_contains a "banana"
-
-  # shellcheck disable=SC2251
-  ! _sha_array_contains a "pple"
-  ! _sha_array_contains a "oran"
-}
-
-test_array_find_first_index() {
-  # shellcheck disable=SC2034
-  a=(apple orange banana)
-  assert_equals 0  "$(_sha_array_find_first_index a "apple")"
-  assert_equals 1  "$(_sha_array_find_first_index a "orange")"
-  assert_equals 2  "$(_sha_array_find_first_index a "banana")"
-
-  # shellcheck disable=SC2251
-  ! _sha_array_find_first_index a "pple"
-  ! _sha_array_find_first_index a "oran"
-}
-
-
-
-test_array_difference() {
-  # shellcheck disable=SC2034
-  a=(apple orange banana kiwi)
-  b=(banana kiwi unkown)
-
-  local x
-  x=$(_sha_array_difference a b)
-  assert_equals "0" "$?"
-
-  assert_contains "apple" "$x"
-  assert_contains "orange" "$x"
-  assert_not_contains "banana" "$x"
-  assert_not_contains "kiwi" "$x"
 }
 
 

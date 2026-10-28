@@ -29,3 +29,6 @@ sha "$@" || exit $?   # 入口：贪心最长匹配，只执行最深命中的�
 * 核心：`sha.bash`
 * 样式：`sha_style.bash`
 * 测试：`test_sha.bash` + `unit_test_framework.bash`（`bash test_sha.bash`）
+* 范例：`examples/`（`bash examples/01-basic.bash --help` 起手）
+
+要求：`Bash 4.4+`（依赖关联数组、nameref）。

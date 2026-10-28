@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 
 # sha.bash 对 bash 环境的影响 (默认全部关闭, 按需开启):
-#   - SHA_DEBUG=1             才挂 trap "_sha_on_error" ERR (打印调用栈)
-#   - SHA_CHECK_SYS_CONFLICT=1 才枚举系统命令做函数名冲突检查
-#   - nullglob: source 时临时打开, 结束即恢复调用方原状, 不污染
+#   - SHA_DEBUG=1 才挂 trap "_sha_on_error" ERR (打印调用栈)
+# 最低版本: Bash 4.4+ (依赖关联数组、nameref、mapfile)
 
 
 # sha.bash消费者请选用以下关键参数，sha.bash默认不开启这些参数，尽量不影响bash默认环境
@@ -17,36 +16,11 @@
                 #   2.we need like this: ${arr[@]+"${arr[@]}"}
                 #   3.影响使用此lib的脚本
 
-# nullglob选项默认off时：
-# -------------------------.bash
-# bash-5.2$ a=(./no_exists_dir/*/sha)
-# bash-5.2$ declare -p a
-# declare -a a=([0]="./no_exists_dir/*/sha")
-# -------------------------
-# 没有匹配到任何文件时，包含字符串字面量，这不是我们要的
-#
-# 而打开nullglob后：
-# -------------------------.bash
-# shopt -s nullglob
-# bash-5.2$ a=(./no_exists_dir/*/sha)
-# bash-5.2$ declare -p a
-# declare -a a=()
-# -------------------------s
-# 空数组!这是我们想要的
-# 只在 source 期间临时打开, 结束后恢复调用方原状 (库不应改全局 shopt)
-if shopt -q nullglob; then
-  _sha_nullglob_was_on=1
-else
-  _sha_nullglob_was_on=0
-  shopt -s nullglob
-fi
 
 
 
 
 
-
-_sha_real_path() {  [[ $1 = /* ]] && echo "$1" || echo "$PWD/${1#./}" ; }
 
 # 自注册约定 (函数名即命令, 无需执行、无需声明):
 #   build.web() / build__web()  →  sha build web      (. 与 __ 都是层级分隔符, 可混用)
@@ -62,36 +36,9 @@ declare -A _SHA_FUNC=()
 declare -A _SHA_PARENT=()
 declare _sha_cmd_exclude=("_*" "fn_*" "sha" "sha__*" "sha_*" "sha.*") # 私有前缀, 不注册为命令
 
-# 系统命令列表, 用于判断我们的命令名是否和系统命令冲突
-declare -A _sha_sys_commands
-
 ##################################################################################################
-### 业务无关的common函数，比如数组、日志等
+### sha 内部工具函数
 ##################################################################################################
-
-# replace $HOME with "~"
-# Usage: _sha_pwd <path>
-# Examples:  
-#  _sha_pwd "/home/chen/git/note/"
-#         ===> "~/git/note/"
-_sha_pwd() {
-  local _path="$1"
-  printf "%s" "${_path/#$HOME/\~}" ; 
-}
-
-# Usage: _sha_log <log_level> <msg...>
-# Examples: 
-#   _sha_log ERROR "错误消息"
-#
-# log_level: DEBUG|INFO|ERROR|FATAL
-_sha_log(){
-  local level="$1"; shift
-  # NOTE: 不用 $(date)/$( _sha_pwd), $(...) 每次 fork; 用内建 printf %T + 参数展开
-  local ts
-  # shellcheck disable=SC2183
-  printf -v ts '%(%F %T)T' -1
-  echo -e "$level $ts ${PWD/#$HOME/\~}\$ ${FUNCNAME[1]}() : $*" >&2
-}
 
 _sha_on_error() {
   local last_command="$BASH_COMMAND" # Bash 特有变量，显示出错的命令
@@ -109,7 +56,6 @@ _sha_on_error() {
 
     # 打印出可读性强的信息:
     #    => ./note/sha:38 -> my_cmd
-    # NOTE: 不用 $(_sha_real_path), 循环内每次 fork; 内联展开即可
     [[ $file = /* ]] || file="$PWD/${file#./}"
     printf "%s\n" "$file:$no -> $func" >&2
 
@@ -124,8 +70,8 @@ _sha_clear_associative_array() {
 
     # 检查是否提供了恰好一个参数 (关联数组的名称)
     if [ "$#" -ne 1 ]; then
-        echo "用法: ${func_name[0]} <关联数组名称>" >&2 # ${func_name[0]} 获取当前函数名
-        echo "示例: ${func_name[0]} my_data_array" >&2
+        echo "用法: _sha_clear_associative_array <关联数组名称>" >&2 # _sha_clear_associative_array 获取当前函数名
+        echo "示例: _sha_clear_associative_array my_data_array" >&2
         return 1
     fi
 
@@ -151,172 +97,13 @@ _sha_clear_associative_array() {
     done
 }
 
-# _sha_reset() 见下文 sha 命令实现区: _sha_reset() { _sha_register_all; }
 
 
 
 
-# 用途：判断数组 array_name 是否包含精确字符串 search_string
-# Useage：_sha_array_regex_match <array_name> <search_regex>
-# 参数：
-#   $1: 数组的名称
-#   $2: 要搜索的字符串正则
-# 返回值：
-#   0 (成功): 如果找到精确匹配的元素
-#   1 (失败): 如果没有找到匹配的元素
-# 示例：
-#  a=("apple" "banana" "cherry")
-# _sha_array_regex_match a "banana" && echo "matched" || echo "not matched"
-# _sha_array_regex_match a "ch.*y" && echo "matched" || echo "not matched"
-_sha_array_regex_match() {
-  local regex="$2"
-  # 使用 'declare -n' 创建一个名称引用 (nameref)
-  # 这使得 'arr_ref' 成为一个指向由 $array_name 指定的实际关联数组的别名
-  # 对 arr_ref 的任何操作都会直接作用于原始关联数组
-  # requires Bash 4.3+
-  declare -n array_ref="$1"
 
-  local element
-  for element in "${array_ref[@]}"; do
-    if [[ "${element}" =~ $regex ]]; then
-      return 0 # 找到精确匹配
-    fi
-  done
-  return 1 # 没有找到匹配
-}
-
-# _sha_array_find_first_index 
-# 注意：此函数的功能是查找索引，而不是简单判断包含元素，但确实可以用于contains包含判断
-# 
-# Usage: _sha_array_find_first_index <array_name> <search_string>
-# 用途：查找数组 array_name 中精确匹配字符串 str 的元素的索引
-# 参数：
-#   $1: 数组的名称 (不需要加 $)
-#   $2: 要搜索的精确字符串
-# 输出：
-#   如果找到匹配的元素，则输出该元素的索引 (第一个匹配项的索引)
-# 返回值：
-#   0 (成功): 如果找到匹配的元素 (并输出了索引)
-#   1 (失败): 如果没有找到匹配的元素
-# 示例：
-#   my_array=("apple" "banana" "cherry")
-#   # 调用函数并捕获输出和返回值
-#   index=$(_sha_array_find_first_index my_array "banana")
-#   result=$?
-#   if [[ "$result" -eq 0 ]]; then
-#     echo "找到 'banana' 在索引: $index"
-#   else
-#     echo "未找到 'banana', 函数返回: $result"
-#   fi
-_sha_array_find_first_index() {
-  local str="$2"
-  # 使用 'declare -n' 创建一个名称引用 (nameref)
-  # 这使得 'array_ref' 成为一个指向由 $array_name 指定的实际数组的别名
-  # 对 array_ref 的任何操作都会直接作用于原始数组
-  # requires Bash 4.3+
-  declare -n array_ref="$1"
-
-  local index # 用于循环的局部变量，表示数组索引
-
-  # 遍历数组的所有索引
-  # ${!array_ref[@]} 扩展为数组的所有索引
-  for index in "${!array_ref[@]}"; do
-    # 访问当前索引对应的元素，并与搜索字符串进行精确比较
-    if [[ "${array_ref[index]}" == "$str" ]]; then
-      echo "$index" # 找到匹配，输出索引
-      return 0      # 返回成功
-    fi
-  done
-
-  # 遍历完成，没有找到匹配
-  # 注意：Bash 返回值通常是 0-255，返回 -1 是非标准的
-  return 1
-}
-
-
-# 判断集合包含关系
-# Usage: _sha_array_contains <array_name> <search_string>
-# 用途：判断数组 array_name 是否包含精确字符串 search_string
-# 函数：_sha_array_contains
-# 用途：判断数组 array_name 是否包含精确字符串 search_string
-# 参数：
-#   $1: 数组的名称 (不需要加 $)
-#   $2: 要搜索的精确字符串
-# 输出：
-#   无输出
-# 返回值：
-#   0 (成功): 如果找到精确匹配的元素
-#   1 (失败): 如果没有找到匹配的元素
-# 示例：
-#   my_array=("apple" "banana" "cherry")
-#   if _sha_array_contains my_array "banana"; then
-#     echo "数组包含 'banana'"
-#   fi
-#   if ! _sha_array_contains my_array "date"; then
-#     echo "数组不包含 'date'"
-#   fi
-_sha_array_contains() {
-  local search_string="$2"
-  # 使用 'declare -n' 创建一个名称引用 (nameref)
-  # 这使得 'array_ref' 成为一个指向由 $array_name 指定的实际数组的别名
-  # 对 array_ref 的任何操作都会直接作用于原始数组
-  # requires Bash 4.3+
-  declare -n array_ref="$1"
-
-  local element # 用于循环的局部变量
-
-  # 遍历数组的所有元素
-  for element in "${array_ref[@]}"; do
-    # 进行精确字符串比较
-    if [[ "${element}" == "$search_string" ]]; then
-      return 0 # 找到精确匹配
-    fi
-  done
-
-  return 1 # 没有找到匹配
-}
-# 函数：_sha_array_difference
-# 用途：输出数组 array1_name 中不包含在数组 array2_name 中的元素
-# 参数：
-#   $1: 第一个数组的名称 (不需要加 $)
-#   $2: 第二个数组的名称 (不需要加 $)
-# 输出：
-#   将差集元素逐行输出到标准输出
-# 返回值：
-#   0 (成功): 函数执行完成
-# 示例：
-#   array1=("apple" "banana" "cherry" "date")
-#   array2=("banana" "date" "fig")
-#   echo "Array 1: ${array1[@]}"
-#   echo "Array 2: ${array2[@]}"
-#   echo "Difference (Array 1 - Array 2):"
-#   _sha_array_difference array1 array2
-#   # 预期输出:
-#   # apple
-#   # cherry
-_sha_array_difference() {
-  # 使用 declare -n 创建 nameref 变量
-  # arr1 将引用传入的第一个数组 (名称为 $1 的数组)
-  # arr2 将引用传入的第二个数组 (名称为 $2 的数组)
-  declare -n arr1="$1"
-  # shellcheck disable=SC2034
-  declare -n arr2="$2"
-
-  local element # 用于循环第一个数组的局部变量
-
-  # 遍历第一个数组的所有元素 (单层循环)
-  for element in "${arr1[@]}"; do
-    # 如果 _sha_array_contains 返回非零状态 (即未找到)，则输出当前元素
-    # 注意：即使 _sha_array_contains 返回 -1，其退出状态在 0-255 范围内是 255 (非零)
-    if ! _sha_array_find_first_index arr2 "$element" > /dev/null; then
-      echo "$element"
-    fi
-  done
-  return 0
-}
 
 ##################################################################################################
-### 上面代码是业务无关的common函数，比如数组等
 ### 下面是sha命令的实现
 ##################################################################################################
 
@@ -356,9 +143,6 @@ _sha_register_all() {
     while [[ "$rest" == *' '* ]]; do rest=${rest% *}; _SHA_PARENT[$rest]=1; done
   done < <(compgen -A function)
 }
-
-# 测试/复用入口: 重建命令表 (现在 _sha_register_all 本身就是无状态重建, 这里只是别名)。
-_sha_reset() { _sha_register_all; }
 
 _sha_help() { # $1=路径 ("" 为根)
   local path=$1 prefix key seg
@@ -428,56 +212,13 @@ sha() {
 }
 
 
-# Usage: _sha_register_sys_commands
-# 用途：初始化系统命令列表 _sha_sys_commands
-_sha_register_sys_commands() {
-  # 所有命令列表, 用于判断我们的命令名是否和系统命令冲突
-  local -a sys_cmds
-  mapfile -t sys_cmds < <(compgen -c)
-
-  local -a ignore_functions
-  mapfile -t ignore_functions < <(compgen -A function)
-
-  local -A ignore_functions_map
-  local item
-  for item in "${ignore_functions[@]}"; do
-    ignore_functions_map["$item"]=1
-  done
-
-
-  local array_length=${#sys_cmds[*]}
-
-  # 遍历 sys_cmds 数组，使用基于数字索引的循环
-  # 这种方式假设数组是稠密的 (索引是连续的，没有空洞)
-  for ((i=0; i<array_length; i++)); do
-    item=${sys_cmds[$i]}
-    # -v 检查键是否存在
-    if [[ ! -v ignore_functions_map["$item"] ]]; then
-      # 如果元素不存在于 ignore_functions_map 中，则将其作为键添加到 _sha_sys_commands 关联数组
-      # 关联数组的值不重要，这里简单设为 1
-      _sha_sys_commands[${item}]=1
-    fi
-  done
-}
 
 
 #######################################
 ## 入口
 #######################################
-# Windows(Git Bash/MSYS2)下说明:
-# 1. compgen -c 会枚举 PATH 下数千个命令+逐个循环, 在 Windows fork 仿真下极慢,
-#    所以默认关闭, 仅在 SHA_CHECK_SYS_CONFLICT=1 时才做系统命令冲突检查。
-# 2. trap ERR 会给每条命令加钩子, Windows 下也有可感知的开销,
-#    默认关闭, 仅在 SHA_DEBUG=1 时开启出错堆栈。
-if [[ "${SHA_CHECK_SYS_CONFLICT:-0}" == "1" ]]; then
-  _sha_register_sys_commands
-fi
+# trap ERR 会给每条命令加钩子, Windows 下有可感知的开销,
+# 默认关闭, 仅在 SHA_DEBUG=1 时开启出错堆栈。
 if [[ "${SHA_DEBUG:-0}" == "1" ]]; then
   trap "_sha_on_error" ERR
 fi
-
-# 恢复调用方的 nullglob 原状 (见文件头)
-if [[ "${_sha_nullglob_was_on:-1}" == "0" ]]; then
-  shopt -u nullglob
-fi
-unset _sha_nullglob_was_on
