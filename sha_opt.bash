@@ -38,14 +38,33 @@ declare -A _SHA_OPT_ORDER=()   # "cmd" -> "var var ..."
 
 _sha_opt_error() { echo "ERROR: $*" >&2; return 1; }
 
-# 用法: sha.option "<cmd>" "<spec>..."
-#   cmd: 命令路径 ("build web") 或 "*" (全局选项)
-sha.option() {
-  local cmd=$1; shift
-  if [[ -z ${cmd:-} || $cmd == ' '* || $cmd == *' ' || $cmd == *'  '* ]]; then
-    _sha_opt_error "命令路径非法 [$cmd]"
-    return $?
+# 命令路径规范化：与 sha.bash 自注册同一套映射（. 与 __ → 空格，单个 _ 不动）。
+# 注册 (sha.option/sha.def/sha.desc/...) 与查找 (sha_opt_parse) 都走这里，所以
+# "build web" / "build.web" / "build__web" 三种写法等价——调用者用什么分隔符都行。
+# $1=原始路径, $2=输出变量名；归一化 + 严格校验，失败返回 1
+_sha_opt_norm_cmd() {
+  local p=$1
+  p=${p//__/ }
+  p=${p//./ }
+  printf -v "$2" '%s' "$p"
+}
+
+_sha_opt_check_cmd() {
+  local raw=$1 outvar=$2 norm=""
+  _sha_opt_norm_cmd "$raw" norm
+  if [[ -z $norm || $norm == ' '* || $norm == *' ' || $norm == *'  '* ]]; then
+    _sha_opt_error "命令路径非法 [$raw]"
+    return 1
   fi
+  printf -v "$outvar" '%s' "$norm"
+}
+
+# 用法: sha.option "<cmd>" "<spec>..."
+#   cmd: 命令路径 ("build web" / "build.web" / "build__web" 等价) 或 "*" (全局选项)
+sha.option() {
+  local raw=$1; shift
+  local cmd=""
+  _sha_opt_check_cmd "$raw" cmd || return $?
   local spec
   for spec in "$@"; do
     _sha_opt_add "$cmd" "$spec" || return $?
@@ -273,9 +292,42 @@ declare -A _SHA_DESC=()
 declare -A _SHA_USAGE=()
 declare -A _SHA_DETAIL=()
 
+# 一次调用定义完一个命令的全部元数据（option/desc/usage/detail），实现体仍是
+# 独立 bash 函数（按名映射发现，见 sha.bash）。底层委托给 sha.option/sha.desc/
+# sha.usage/sha.detail，任一步失败即返回非零。
+#
+# 自举：本函数的四个参数直接用 option 语法声明（见文件尾 "sha def" 注册），
+# 解析走 sha_opt_parse，与用户命令同一套逻辑。
+#
+# 用法: sha.def "<cmd>" [--desc T] [--usage U] [--detail D] [--opt SPEC]...
+sha.def() {
+  if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    _sha_opt_print_help "sha def"
+    return 0
+  fi
+  local raw=$1; shift
+  [[ -n ${raw:-} && $raw != -* ]] || { _sha_opt_error "sha.def 需要命令路径"; return $?; }
+  local cmd=""
+  _sha_opt_check_cmd "$raw" cmd || return $?
+  local desc="" usage="" detail=""
+  local -a opt=() rest=()
+  sha_opt_parse rest "$@" || return $?
+  if (( ${#rest[@]} )); then
+    _sha_opt_error "sha.def [$cmd] 不接受位置参数 [${rest[*]}]"
+    return $?
+  fi
+  [[ -n $desc ]] && { sha.desc "$cmd" "$desc" || return $?; }
+  [[ -n $usage ]] && { sha.usage "$cmd" "$usage" || return $?; }
+  [[ -n $detail ]] && { sha.detail "$cmd" "$detail" || return $?; }
+  if (( ${#opt[@]} )); then
+    sha.option "$cmd" "${opt[@]}" || return $?
+  fi
+}
+
 sha.desc() {
-  local cmd=$1 text=${2:-}
-  [[ -n ${cmd:-} ]] || { _sha_opt_error "sha.desc 需要命令路径"; return $?; }
+  local raw=$1 text=${2:-} cmd=""
+  [[ -n ${raw:-} ]] || { _sha_opt_error "sha.desc 需要命令路径"; return $?; }
+  _sha_opt_norm_cmd "$raw" cmd
   case $text in
     *$'\n'*) _sha_opt_error "sha.desc 只接受单行 [$cmd]，多行请用 sha.detail"; return $? ;;
   esac
@@ -283,13 +335,17 @@ sha.desc() {
 }
 
 sha.usage() {
-  [[ -n ${1:-} ]] || { _sha_opt_error "sha.usage 需要命令路径"; return $?; }
-  _SHA_USAGE[$1]=${2:-}
+  local raw=$1 cmd=""
+  [[ -n ${raw:-} ]] || { _sha_opt_error "sha.usage 需要命令路径"; return $?; }
+  _sha_opt_norm_cmd "$raw" cmd
+  _SHA_USAGE[$cmd]=${2:-}
 }
 
 sha.detail() {
-  [[ -n ${1:-} ]] || { _sha_opt_error "sha.detail 需要命令路径"; return $?; }
-  _SHA_DETAIL[$1]=${2:-}
+  local raw=$1 cmd=""
+  [[ -n ${raw:-} ]] || { _sha_opt_error "sha.detail 需要命令路径"; return $?; }
+  _sha_opt_norm_cmd "$raw" cmd
+  _SHA_DETAIL[$cmd]=${2:-}
 }
 
 # 是否有完整 help 可打 (spec / desc / usage / detail 任一，或全局选项存在)
@@ -418,8 +474,8 @@ sha_opt_parse() {
   }
   local caller=${FUNCNAME[1]:-}
   [[ -n $caller ]] || { _sha_opt_error "sha_opt_parse 必须在命令函数内调用"; return $?; }
-  local cmd=${caller//__/ }
-  cmd=${cmd//./ }
+  local cmd=""
+  _sha_opt_norm_cmd "$caller" cmd
 
   # pos 数组名不得与本命令/全局的选项变量重名，否则位置参数无处可写
   local cv
@@ -626,3 +682,14 @@ _sha_opt_take_value() {
   fi
   _given[$key]=1
 }
+
+##################################################################################################
+### 自举: sha.def 自己的四个参数也用 option 语法声明
+### (调用者函数名 "sha.def" 按 . 分层映射到命令路径 "sha def"，正好命中本表)
+##################################################################################################
+
+sha.option "sha def" \
+  "--desc:string:命令一句话说明" \
+  "--usage:string:用法行" \
+  "--detail:string:多行补充说明" \
+  "--opt:list:选项定义 (可重复)"

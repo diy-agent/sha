@@ -363,6 +363,126 @@ test_S25_short_clash_global() {
   assert_contains "ok=ques" "$out"
 }
 
+# S26 sha.def 一次调用：desc + usage + opt
+test_S26_def_full() {
+  local out rc=0
+  out=$(sha.def "svc" \
+    --desc "服务管理" \
+    --usage "sha svc [--port P]" \
+    --opt "--port:int=8080:端口" 2>&1 \
+    && printf '|type=%s|def=%s|desc=%s|usage=%s' \
+      "${_SHA_OPT_TYPE[svc|port]}" "${_SHA_OPT_DEFAULT[svc|port]}" \
+      "${_SHA_DESC[svc]}" "${_SHA_USAGE[svc]}") || rc=$?
+  assert_equals "0" "$rc"
+  assert_contains "type=int" "$out"
+  assert_contains "def=8080" "$out"
+  assert_contains "desc=服务管理" "$out"
+  assert_contains "usage=sha svc" "$out"
+}
+
+# S27 sha.def：detail + 多个 opt（含短名）+ 等号形式
+test_S27_def_detail_multi() {
+  local out rc=0
+  out=$(sha.def "svc web" \
+    --desc="web 服务" \
+    --detail="备注：端口必填。" \
+    --opt="-p,--port:string!:端口" \
+    --opt="--release:bool:优化构建" 2>&1 \
+    && printf '|detail=%s|req=%s|short=%s' \
+      "${_SHA_DETAIL[svc web]}" "${_SHA_OPT_REQUIRED[svc web|port]}" \
+      "${_SHA_OPT_SHORT[svc web|p]}") || rc=$?
+  assert_equals "0" "$rc"
+  assert_contains "detail=备注" "$out"
+  assert_contains "req=1" "$out"
+  assert_contains "short=port" "$out"
+}
+
+# S28 sha.def 未知参数（走同一套 unknown option 报错）
+test_S28_def_unknown_flag() {
+  local out rc=0
+  out=$(sha.def "svc" --bogus x 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "unknown option" "$out"
+}
+
+# S29 sha.def 行尾缺值
+test_S29_def_missing_value() {
+  local out rc=0
+  out=$(sha.def "svc" --desc 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "requires a value" "$out"
+}
+
+# S30 sha.def 透传校验：坏 spec / 多行 desc 照拦
+test_S30_def_passthrough_errors() {
+  local out rc=0
+  out=$(sha.def "svc" --opt "--release:bool=1:x" 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "bool" "$out"
+  rc=0
+  out=$(sha.def "svc" --desc "$(printf 'a\nb')" 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "单行" "$out"
+}
+
+# S31 sha.def 无参数：静默成功（占位）
+test_S31_def_empty() {
+  local out rc=0
+  out=$(sha.def "svc" 2>&1) || rc=$?
+  assert_equals "0" "$rc"
+  assert_equals "" "$out"
+}
+
+# S32 sha.def 命令路径缺失或以 - 开头
+test_S32_def_bad_cmd() {
+  local out rc=0
+  out=$(sha.def --desc x 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "需要命令路径" "$out"
+}
+
+# S33 sha.def --help：打印自身 help，返回 0
+test_S33_def_help() {
+  local out rc=0
+  out=$(sha.def --help 2>&1) || rc=$?
+  assert_equals "0" "$rc"
+  assert_contains "command: sha def" "$out"
+  assert_contains -- "--opt" "$out"
+}
+
+# S34 sha.def 不接受位置参数（-- 之后的也不行）
+test_S34_def_no_positional() {
+  local out rc=0
+  out=$(sha.def "svc" -- --opt "--port:int=1:x" 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "不接受位置参数" "$out"
+}
+
+# S35 注册三种分隔符写法等价（归一化到空格；查找侧函数名同样归一化）
+test_S35_separator_forms() {
+  local out rc=0
+  out=$(sha.option "net.web" "--host:string:h:主机" 2>&1 \
+    && sha.option "net__web" "--port:int=80:端口" 2>&1 \
+    && sha.option "net web" "--tls:bool:加密" 2>&1 \
+    && printf '|order=%s|host=%s' "${_SHA_OPT_ORDER[net web]}" \
+      "${_SHA_OPT_TYPE[net web|host]}") || rc=$?
+  assert_equals "0" "$rc"
+  assert_contains "order=host port tls" "$out"
+  assert_contains "host=string" "$out"
+}
+
+# S36 非法路径归一化后同样拦截（"a__" → "a " 尾空格）
+test_S36_bad_path_after_norm() {
+  local out rc=0
+  out=$(sha.option "a__" "--x:string:x" 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "命令路径非法" "$out"
+  rc=0
+  out=$(sha.def "b..c" --desc x 2>&1) || rc=$?
+  assert_equals "1" "$rc"
+  assert_contains "命令路径非法" "$out"
+}
+
 sha_run() { "$@" 2>&1; }
 
 # ---- 运行时用例 (解析 + 分发 + help)：demo 命令顶层注册 ----
@@ -819,6 +939,21 @@ test_T30_pos_array_collision() {
   out=$(sha_run fixture posdemo 2>&1) || rc=$?
   assert_equals "1" "$rc"
   assert_contains "重名" "$out"
+}
+
+# T31 点分隔注册 + 点分隔函数，空格分发照样命中（用户用什么分隔符写都行）
+test_T31_dot_form_end_to_end() {
+  fixture() {
+    sha.def "net.web" --opt "--host:string:h:主机" --desc "网络" || return $?
+    net.web() {
+      local host
+      local -a files=()
+      sha_opt_parse files "$@" || return $?
+      printf 'host=%s files=%s' "$host" "${files[*]}"
+    }
+    sha "$@"
+  }
+  assert_equals "host=example.com files=a" "$(sha_run fixture net web --host example.com a)"
 }
 
 run_tests
