@@ -145,7 +145,7 @@ _sha_register_all() {
 }
 
 _sha_help() { # $1=路径 ("" 为根)
-  local path=$1 prefix key seg
+  local path=$1 prefix key seg desc
   if [[ -z "$path" ]]; then prefix=""; else prefix="$path "; fi
   echo
   echo "${BASH_SOURCE[-1]} help:"
@@ -166,10 +166,12 @@ _sha_help() { # $1=路径 ("" 为根)
     seen[$seg]=1
   done
   for seg in "${!seen[@]}"; do
+    desc=""
+    if declare -p _SHA_DESC >/dev/null 2>&1; then desc=${_SHA_DESC[$prefix$seg]:-}; fi
     if [[ -n "${_SHA_PARENT[$prefix$seg]+x}" ]]; then
-      printf '  %s/\n' "$seg"
+      printf '  %s/%s\n' "$seg" "${desc:+  $desc}"
     else
-      printf '  %s\n' "$seg"
+      printf '  %s%s\n' "$seg" "${desc:+  $desc}"
     fi
   done | sort
   echo
@@ -186,7 +188,13 @@ sha() {
   _sha_register_all || return $?
   local path="" cand
   while (( $# > 0 )); do
-    case $1 in -h|--help) _sha_help "$path"; return 0;; esac
+    case $1 in -h|--help)
+      if [[ -n $path ]] && declare -F _sha_opt_print_help >/dev/null 2>&1 \
+        && _sha_opt_has_help "$path" 2>/dev/null; then
+        _sha_opt_print_help "$path"; return 0
+      fi
+      _sha_help "$path"; return 0;;
+    esac
     if [[ -z "$path" ]]; then cand=$1; else cand="$path $1"; fi
     if [[ -n "${_SHA_PARENT[$cand]+x}" || -n "${_SHA_FUNC[$cand]+x}" ]]; then
       path=$cand; shift
@@ -208,7 +216,12 @@ sha() {
     return 1
   fi
   # 用 return 而不用 exit: sha.bash 是被 source 的库, 不能替调用方决定进程生死。
-  local fn=${_SHA_FUNC[$path]}; "$fn" "$@"
+  local fn=${_SHA_FUNC[$path]}
+  # option 层预扫: 余下参数在 -- 之前出现 -h/--help 即打完整 help，不进函数
+  if declare -F _sha_opt_pre_scan >/dev/null 2>&1 && _sha_opt_pre_scan "$path" "$@"; then
+    return 0
+  fi
+  "$fn" "$@"
 }
 
 

@@ -16,3 +16,4 @@
 - `02-subcommand.bash`：`.`/`__` 分层、父命令自己也有实现、参数透传
 - `03-help-root-exitcode.bash`：`root()`、`-h/--help`、退出码 0/1/3
 - `04-style.bash`：`sha_style.bash` 独立演示（注意：不要和 `sha.bash` 混 source）
+- `05-opt-help.bash`：option + help 结合（`sha.option`/`sha.desc`/`sha.usage`/`sha.detail` + `sha_opt_parse`）
